@@ -5,6 +5,10 @@ use wgpu::{BindGroupLayout, MultisampleState, StoreOp};
 
 /// A texture and a buffer for reading the rendered frame back to the cpu.
 ///
+/// It is also the intermediate texture egui renders to on a linear float surface
+/// (see [`crate::WgpuConfiguration::linear_float_surface`]); its copy to the surface
+/// then decodes the gamma-encoded colors to linear.
+///
 /// The texture is required since [`wgpu::TextureUsages::COPY_SRC`] is not an allowed
 /// flag for the surface texture on all platforms. This means that anytime we want to
 /// capture the frame, we first render it to this texture, and then we can copy it to
@@ -16,6 +20,8 @@ pub struct CaptureState {
     pub texture: wgpu::Texture,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// The [`crate::LinearOutput`] uniform, on a linear surface.
+    linear_output: Option<wgpu::Buffer>,
 }
 
 pub type CaptureReceiver = mpsc::Receiver<(ViewportId, Vec<UserData>, ColorImage)>;
@@ -23,7 +29,8 @@ pub type CaptureSender = mpsc::Sender<(ViewportId, Vec<UserData>, ColorImage)>;
 pub use mpsc::channel as capture_channel;
 
 impl CaptureState {
-    pub fn new(device: &wgpu::Device, surface_texture: &wgpu::Texture) -> Self {
+    /// `linear`: the copy to the surface decodes extended sRGB to linear.
+    pub fn new(device: &wgpu::Device, surface_texture: &wgpu::Texture, linear: bool) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("texture_copy.wgsl"));
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -37,7 +44,7 @@ impl CaptureState {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some(if linear { "fs_main_linear" } else { "fs_main" }),
                 compilation_options: Default::default(),
                 targets: &[Some(surface_texture.format().into())],
             }),
@@ -53,14 +60,27 @@ impl CaptureState {
 
         let bind_group_layout = pipeline.get_bind_group_layout(0);
 
-        let (texture, padding, bind_group) =
-            Self::create_texture(device, surface_texture, &bind_group_layout);
+        let linear_output = linear.then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("egui_linear_output"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let (texture, padding, bind_group) = Self::create_texture(
+            device,
+            surface_texture,
+            &bind_group_layout,
+            linear_output.as_ref(),
+        );
 
         Self {
             padding,
             texture,
             pipeline,
             bind_group,
+            linear_output,
         }
     }
 
@@ -68,6 +88,7 @@ impl CaptureState {
         device: &wgpu::Device,
         surface_texture: &wgpu::Texture,
         layout: &BindGroupLayout,
+        linear_output: Option<&wgpu::Buffer>,
     ) -> (wgpu::Texture, BufferPadding, wgpu::BindGroup) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("egui_screen_capture_texture"),
@@ -86,12 +107,19 @@ impl CaptureState {
 
         let view = texture.create_view(&Default::default());
 
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }];
+        if let Some(buffer) = linear_output {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffer.as_entire_binding(),
+            });
+        }
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
+            entries: &entries,
             label: None,
         });
 
@@ -101,8 +129,12 @@ impl CaptureState {
     /// Updates the [`CaptureState`] if the size of the surface texture has changed
     pub fn update(&mut self, device: &wgpu::Device, texture: &wgpu::Texture) {
         if self.texture.size() != texture.size() {
-            let (new_texture, padding, bind_group) =
-                Self::create_texture(device, texture, &self.pipeline.get_bind_group_layout(0));
+            let (new_texture, padding, bind_group) = Self::create_texture(
+                device,
+                texture,
+                &self.pipeline.get_bind_group_layout(0),
+                self.linear_output.as_ref(),
+            );
             self.texture = new_texture;
             self.padding = padding;
             self.bind_group = bind_group;
@@ -117,12 +149,16 @@ impl CaptureState {
         output_frame: &wgpu::SurfaceTexture,
         encoder: &mut wgpu::CommandEncoder,
     ) -> wgpu::Buffer {
-        debug_assert_eq!(
-            self.texture.size(),
-            output_frame.texture.size(),
-            "Texture sizes must match, `CaptureState::update` was probably not called"
-        );
+        let buffer = self.copy_to_buffer(device, encoder);
+        self.copy_to_surface(output_frame, encoder);
+        buffer
+    }
 
+    fn copy_to_buffer(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> wgpu::Buffer {
         // It would be more efficient to reuse the Buffer, e.g. via some kind of ring buffer, but
         // for most screenshot use cases this should be fine. When taking many screenshots (e.g. for a video)
         // it might make sense to revisit this and implement a more efficient solution.
@@ -150,7 +186,30 @@ impl CaptureState {
             },
             tex_extent,
         );
+        buffer
+    }
 
+    /// Sets where black and SDR white land on a linear surface, for the next copy.
+    pub fn set_linear_output(&self, queue: &wgpu::Queue, output: crate::LinearOutput) {
+        if let Some(buffer) = &self.linear_output {
+            let values = [output.white, output.black, 0.0, 0.0];
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            queue.write_buffer(buffer, 0, &bytes);
+        }
+    }
+
+    /// Copies the texture to the surface texture, decoding it to linear if this
+    /// state was made for a linear surface.
+    pub fn copy_to_surface(
+        &self,
+        output_frame: &wgpu::SurfaceTexture,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        debug_assert_eq!(
+            self.texture.size(),
+            output_frame.texture.size(),
+            "Texture sizes must match, `CaptureState::update` was probably not called"
+        );
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("texture_copy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -171,8 +230,6 @@ impl CaptureState {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
-
-        buffer
     }
 
     /// Handles copying from the [`CaptureState`] texture to the surface texture and the cpu

@@ -120,6 +120,7 @@ impl Painter {
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: render_state.target_format,
+            color_space: render_state.target_color_space,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
             view_formats: vec![render_state.target_format],
@@ -631,9 +632,13 @@ impl Painter {
         {
             let renderer = render_state.renderer.read();
 
-            let target_texture = if capture {
+            // A linear surface is drawn through the capture texture too, whose copy to the
+            // surface decodes egui's gamma-encoded colors.
+            let linear =
+                render_state.target_color_space == wgpu::SurfaceColorSpace::ExtendedSrgbLinear;
+            let target_texture = if capture || linear {
                 let capture_state = self.screen_capture_state.get_or_insert_with(|| {
-                    CaptureState::new(&render_state.device, &output_frame.texture)
+                    CaptureState::new(&render_state.device, &output_frame.texture, linear)
                 });
                 capture_state.update(&render_state.device, &output_frame.texture);
 
@@ -707,12 +712,20 @@ impl Painter {
                 &screen_descriptor,
             );
 
-            if capture && let Some(capture_state) = &mut self.screen_capture_state {
-                capture_buffer = Some(capture_state.copy_textures(
-                    &render_state.device,
-                    &output_frame,
-                    &mut encoder,
-                ));
+            if let Some(capture_state) = &mut self.screen_capture_state {
+                if linear {
+                    capture_state
+                        .set_linear_output(&render_state.queue, *render_state.linear_output.read());
+                }
+                if capture {
+                    capture_buffer = Some(capture_state.copy_textures(
+                        &render_state.device,
+                        &output_frame,
+                        &mut encoder,
+                    ));
+                } else if linear {
+                    capture_state.copy_to_surface(&output_frame, &mut encoder);
+                }
             }
         }
 

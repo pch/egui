@@ -127,6 +127,18 @@ pub struct RenderState {
     /// The target texture format used for presenting to the window.
     pub target_format: wgpu::TextureFormat,
 
+    /// The color space the window's surface is configured with.
+    ///
+    /// [`wgpu::SurfaceColorSpace::ExtendedSrgbLinear`] only when
+    /// [`WgpuConfiguration::linear_float_surface`] asked for it and the surface offers it
+    /// for [`Self::target_format`]: egui then renders to an intermediate texture of
+    /// `target_format` and converts its gamma-encoded colors to linear when presenting.
+    pub target_color_space: wgpu::SurfaceColorSpace,
+
+    /// Where black and SDR white land on a linear surface; the app updates it as the
+    /// display changes, and the next frame presents with it. Unused otherwise.
+    pub linear_output: Arc<RwLock<LinearOutput>>,
+
     /// Egui renderer responsible for drawing the UI.
     pub renderer: Arc<RwLock<Renderer>>,
 
@@ -268,13 +280,14 @@ impl RenderState {
 
         log_adapter_info(&adapter.get_info());
 
-        let surface_formats = {
+        let capabilities = compatible_surface.map(|s| {
             profiling::scope!("get_capabilities");
-            compatible_surface.map_or_else(
-                || vec![wgpu::TextureFormat::Rgba8Unorm],
-                |s| s.get_capabilities(&adapter).formats,
-            )
-        };
+            s.get_capabilities(&adapter)
+        });
+        let surface_formats = capabilities.as_ref().map_or_else(
+            || vec![wgpu::TextureFormat::Rgba8Unorm],
+            |c| c.formats.clone(),
+        );
         let target_format = match config
             .surface_format_selector
             .as_ref()
@@ -284,6 +297,12 @@ impl RenderState {
             Some(format) => format,
             None => crate::preferred_framebuffer_format(&surface_formats)?,
         };
+
+        let target_color_space = target_color_space(
+            config.linear_float_surface,
+            target_format,
+            capabilities.as_ref(),
+        );
 
         let renderer = Renderer::new(&device, target_format, options);
 
@@ -298,6 +317,8 @@ impl RenderState {
             device,
             queue,
             target_format,
+            target_color_space,
+            linear_output: Default::default(),
             renderer: Arc::new(RwLock::new(renderer)),
             surface_config: config.surface,
         })
@@ -368,6 +389,61 @@ pub struct WgpuConfiguration {
     /// gamma-encoded colors to a non-sRGB format.
     pub surface_format_selector:
         Option<Arc<dyn Fn(&[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> + Send + Sync>>,
+
+    /// Present a float surface (see [`Self::surface_format_selector`]) as linear
+    /// extended sRGB ([`wgpu::SurfaceColorSpace::ExtendedSrgbLinear`], scRGB), where the
+    /// surface offers it for that format.
+    ///
+    /// Some platforms (Wayland) have no extended *gamma-encoded* sRGB, only linear. egui
+    /// still renders gamma-encoded colors, blended as on any other surface, into an
+    /// intermediate texture, and a last pass decodes them to linear; values above 1 stay
+    /// above 1, mirrored below 0, so `1.0` remains SDR white. Off by default.
+    pub linear_float_surface: bool,
+}
+
+/// Where egui's black and SDR white land on a linear float surface
+/// ([`RenderState::target_color_space`] is
+/// [`wgpu::SurfaceColorSpace::ExtendedSrgbLinear`]), as linear values: a decoded
+/// color `c` is presented as `black + c * (white - black)`, so values above SDR white
+/// keep their ratio to it.
+///
+/// Compositors read a linear surface differently: Windows' scRGB puts 1.0 at 80 cd/m²,
+/// not at the user's SDR white, and Hyprland shows a linear surface's 0 below the
+/// floor its sRGB windows' black sits on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearOutput {
+    /// SDR white; 1 by default.
+    pub white: f32,
+    /// Black; 0 by default.
+    pub black: f32,
+}
+
+impl Default for LinearOutput {
+    fn default() -> Self {
+        Self {
+            white: 1.0,
+            black: 0.0,
+        }
+    }
+}
+
+/// The color space to configure the surface with; see
+/// [`WgpuConfiguration::linear_float_surface`].
+fn target_color_space(
+    linear_float_surface: bool,
+    format: wgpu::TextureFormat,
+    capabilities: Option<&wgpu::SurfaceCapabilities>,
+) -> wgpu::SurfaceColorSpace {
+    let float = format == wgpu::TextureFormat::Rgba16Float;
+    let offered = capabilities.is_some_and(|c| {
+        c.color_spaces(format)
+            .contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR)
+    });
+    if linear_float_surface && float && offered {
+        wgpu::SurfaceColorSpace::ExtendedSrgbLinear
+    } else {
+        wgpu::SurfaceColorSpace::Auto
+    }
 }
 
 #[test]
@@ -383,11 +459,16 @@ impl core::fmt::Debug for WgpuConfiguration {
             wgpu_setup,
             on_surface_status: _,
             surface_format_selector,
+            linear_float_surface,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
             .field("wgpu_setup", &wgpu_setup)
-            .field("surface_format_selector", &surface_format_selector.is_some())
+            .field(
+                "surface_format_selector",
+                &surface_format_selector.is_some(),
+            )
+            .field("linear_float_surface", linear_float_surface)
             .finish_non_exhaustive()
     }
 }
@@ -432,6 +513,7 @@ impl Default for WgpuConfiguration {
                 }
             }),
             surface_format_selector: None,
+            linear_float_surface: false,
         }
     }
 }
