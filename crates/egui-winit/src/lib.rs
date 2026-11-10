@@ -1415,22 +1415,32 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
+// Windows' legacy clipboard chords (Shift+Delete, Ctrl+Insert, Shift+Insert)
+// count only with exactly their own modifiers. With others held, such as
+// Ctrl+Alt+Shift+Delete, they are ordinary keys an app may bind; reading them
+// as Cut, Copy or Paste would swallow the key event.
 fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
     keycode == egui::Key::Cut
         || (modifiers.command && keycode == egui::Key::X)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Delete)
+        || (cfg!(target_os = "windows")
+            && modifiers.matches_exact(egui::Modifiers::SHIFT)
+            && keycode == egui::Key::Delete)
 }
 
 fn is_copy_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
     keycode == egui::Key::Copy
         || (modifiers.command && keycode == egui::Key::C)
-        || (cfg!(target_os = "windows") && modifiers.ctrl && keycode == egui::Key::Insert)
+        || (cfg!(target_os = "windows")
+            && modifiers.matches_exact(egui::Modifiers::CTRL)
+            && keycode == egui::Key::Insert)
 }
 
 fn is_paste_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
     keycode == egui::Key::Paste
         || (modifiers.command && keycode == egui::Key::V)
-        || (cfg!(target_os = "windows") && modifiers.shift && keycode == egui::Key::Insert)
+        || (cfg!(target_os = "windows")
+            && modifiers.matches_exact(egui::Modifiers::SHIFT)
+            && keycode == egui::Key::Insert)
 }
 
 fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::PointerButton> {
@@ -2331,5 +2341,50 @@ pub fn short_window_event_description(event: &winit::event::WindowEvent) -> &'st
         WindowEvent::ThemeChanged { .. } => "WindowEvent::ThemeChanged",
         WindowEvent::Occluded { .. } => "WindowEvent::Occluded",
         WindowEvent::PanGesture { .. } => "WindowEvent::PanGesture",
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_clipboard_chord_tests {
+    use super::{is_copy_command, is_cut_command, is_paste_command};
+    use egui::{Key, Modifiers};
+
+    // What egui-winit reports for Ctrl on Windows: `command` follows `ctrl`.
+    const CTRL: Modifiers = Modifiers {
+        ctrl: true,
+        command: true,
+        ..Modifiers::NONE
+    };
+
+    #[test]
+    fn legacy_chords_are_clipboard_commands() {
+        assert!(is_cut_command(Modifiers::SHIFT, Key::Delete));
+        assert!(is_copy_command(CTRL, Key::Insert));
+        assert!(is_paste_command(Modifiers::SHIFT, Key::Insert));
+    }
+
+    #[test]
+    fn legacy_chords_with_other_modifiers_are_keys() {
+        let ctrl_alt_shift = CTRL | Modifiers::ALT | Modifiers::SHIFT;
+        assert!(!is_cut_command(ctrl_alt_shift, Key::Delete));
+        assert!(!is_cut_command(CTRL | Modifiers::SHIFT, Key::Delete));
+        assert!(!is_cut_command(
+            Modifiers::ALT | Modifiers::SHIFT,
+            Key::Delete
+        ));
+        assert!(!is_copy_command(CTRL | Modifiers::SHIFT, Key::Insert));
+        assert!(!is_copy_command(CTRL | Modifiers::ALT, Key::Insert));
+        assert!(!is_paste_command(CTRL | Modifiers::SHIFT, Key::Insert));
+        assert!(!is_paste_command(
+            Modifiers::ALT | Modifiers::SHIFT,
+            Key::Insert
+        ));
+    }
+
+    #[test]
+    fn letter_chords_are_unchanged() {
+        assert!(is_cut_command(CTRL | Modifiers::SHIFT, Key::X));
+        assert!(is_copy_command(CTRL | Modifiers::SHIFT, Key::C));
+        assert!(is_paste_command(CTRL | Modifiers::ALT, Key::V));
     }
 }
