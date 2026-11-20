@@ -20,6 +20,9 @@ struct SurfaceState {
     resizing: bool,
     needs_reconfigure: bool,
     needs_recreate: bool,
+    /// The format and color space the surface was last configured with; see
+    /// [`RenderState::surface_format`].
+    configured: Option<(wgpu::TextureFormat, wgpu::SurfaceColorSpace)>,
 }
 
 /// Everything you need to paint egui with [`wgpu`] on [`winit`].
@@ -94,7 +97,7 @@ impl Painter {
     }
 
     fn configure_surface(
-        surface_state: &SurfaceState,
+        surface_state: &mut SurfaceState,
         render_state: &RenderState,
         config: &SurfaceConfig,
     ) {
@@ -116,14 +119,15 @@ impl Painter {
 
         let width = surface_state.width;
         let height = surface_state.height;
+        let (format, color_space) = render_state.surface_format();
 
         let mut surf_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: render_state.target_format,
-            color_space: render_state.target_color_space,
+            format,
+            color_space,
             present_mode,
             alpha_mode: surface_state.alpha_mode,
-            view_formats: vec![render_state.target_format],
+            view_formats: vec![format],
             ..surface_state
                 .surface
                 .get_default_config(&render_state.adapter, width, height)
@@ -137,6 +141,7 @@ impl Painter {
         surface_state
             .surface
             .configure(&render_state.device, &surf_config);
+        surface_state.configured = Some((format, color_space));
     }
 
     /// Drop the existing [`wgpu::Surface`] for `viewport_id` and create a fresh one for the
@@ -299,6 +304,7 @@ impl Painter {
                 resizing,
                 needs_reconfigure: false,
                 needs_recreate: false,
+                configured: None,
             },
         );
         let Some(width) = NonZeroU32::new(width) else {
@@ -587,6 +593,14 @@ impl Painter {
             )
         };
 
+        // The app asked for the other presentation of a linear float surface.
+        if surface_state
+            .configured
+            .is_some_and(|configured| configured != render_state.surface_format())
+        {
+            surface_state.needs_reconfigure = true;
+        }
+
         if surface_state.needs_reconfigure {
             Self::configure_surface(surface_state, render_state, &self.config.surface);
             surface_state.needs_reconfigure = false;
@@ -633,12 +647,26 @@ impl Painter {
             let renderer = render_state.renderer.read();
 
             // A linear surface is drawn through the capture texture too, whose copy to the
-            // surface decodes egui's gamma-encoded colors.
-            let linear =
+            // surface decodes egui's gamma-encoded colors; presented through its 8-bit
+            // format instead, the copy keeps them as they are.
+            let through =
                 render_state.target_color_space == wgpu::SurfaceColorSpace::ExtendedSrgbLinear;
-            let target_texture = if capture || linear {
+            let linear = through && output_frame.texture.format() == render_state.target_format;
+            if self
+                .screen_capture_state
+                .as_ref()
+                .is_some_and(|state| !state.presents(output_frame.texture.format(), linear))
+            {
+                self.screen_capture_state = None;
+            }
+            let target_texture = if capture || through {
                 let capture_state = self.screen_capture_state.get_or_insert_with(|| {
-                    CaptureState::new(&render_state.device, &output_frame.texture, linear)
+                    CaptureState::new(
+                        &render_state.device,
+                        &output_frame.texture,
+                        render_state.target_format,
+                        linear,
+                    )
                 });
                 capture_state.update(&render_state.device, &output_frame.texture);
 
@@ -723,7 +751,7 @@ impl Painter {
                         &output_frame,
                         &mut encoder,
                     ));
-                } else if linear {
+                } else if through {
                     capture_state.copy_to_surface(&output_frame, &mut encoder);
                 }
             }

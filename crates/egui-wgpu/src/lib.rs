@@ -37,7 +37,10 @@ pub mod capture;
 #[cfg(feature = "winit")]
 pub mod winit;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use epaint::mutex::RwLock;
 
@@ -139,6 +142,20 @@ pub struct RenderState {
     /// display changes, and the next frame presents with it. Unused otherwise.
     pub linear_output: Arc<RwLock<LinearOutput>>,
 
+    /// The 8-bit format a linear float surface can present through instead
+    /// ([`Self::present_sdr`]); `None` unless [`Self::target_color_space`] is
+    /// [`wgpu::SurfaceColorSpace::ExtendedSrgbLinear`].
+    pub sdr_format: Option<wgpu::TextureFormat>,
+
+    /// Present a linear float surface through [`Self::sdr_format`] instead, while
+    /// the display shows no HDR: egui still renders to its intermediate texture of
+    /// [`Self::target_format`], so renderer and paint callbacks are unchanged, and
+    /// the last pass copies it to the 8-bit surface as it is. The app sets it as
+    /// the display changes; the next frame reconfigures the surface when it differs.
+    /// Some compositors read a float surface on an SDR desktop differently from an
+    /// 8-bit one: a GeForce under Windows 10 flickered the whole screen with it.
+    pub present_sdr: Arc<AtomicBool>,
+
     /// Egui renderer responsible for drawing the UI.
     pub renderer: Arc<RwLock<Renderer>>,
 
@@ -209,6 +226,18 @@ async fn request_adapter(
 }
 
 impl RenderState {
+    /// The format and color space the window's surface is configured with now:
+    /// [`Self::sdr_format`] while [`Self::present_sdr`] asks for it, otherwise
+    /// [`Self::target_format`] in [`Self::target_color_space`].
+    pub fn surface_format(&self) -> (wgpu::TextureFormat, wgpu::SurfaceColorSpace) {
+        match self.sdr_format {
+            Some(format) if self.present_sdr.load(Ordering::Relaxed) => {
+                (format, wgpu::SurfaceColorSpace::Auto)
+            }
+            _ => (self.target_format, self.target_color_space),
+        }
+    }
+
     /// Creates a new [`RenderState`], containing everything needed for drawing egui with wgpu.
     ///
     /// # Errors
@@ -304,6 +333,11 @@ impl RenderState {
             capabilities.as_ref(),
         );
 
+        let sdr_format = (target_color_space == wgpu::SurfaceColorSpace::ExtendedSrgbLinear)
+            .then(|| crate::preferred_framebuffer_format(&surface_formats).ok())
+            .flatten()
+            .filter(|format| *format != target_format);
+
         let renderer = Renderer::new(&device, target_format, options);
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
@@ -319,6 +353,8 @@ impl RenderState {
             target_format,
             target_color_space,
             linear_output: Default::default(),
+            sdr_format,
+            present_sdr: Default::default(),
             renderer: Arc::new(RwLock::new(renderer)),
             surface_config: config.surface,
         })

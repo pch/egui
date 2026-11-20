@@ -22,6 +22,8 @@ pub struct CaptureState {
     bind_group: wgpu::BindGroup,
     /// The [`crate::LinearOutput`] uniform, on a linear surface.
     linear_output: Option<wgpu::Buffer>,
+    /// The surface format the copy's pipeline writes.
+    surface_format: wgpu::TextureFormat,
 }
 
 pub type CaptureReceiver = mpsc::Receiver<(ViewportId, Vec<UserData>, ColorImage)>;
@@ -29,8 +31,14 @@ pub type CaptureSender = mpsc::Sender<(ViewportId, Vec<UserData>, ColorImage)>;
 pub use mpsc::channel as capture_channel;
 
 impl CaptureState {
-    /// `linear`: the copy to the surface decodes extended sRGB to linear.
-    pub fn new(device: &wgpu::Device, surface_texture: &wgpu::Texture, linear: bool) -> Self {
+    /// `format`: the texture's, egui's target format. `linear`: the copy to the
+    /// surface decodes extended sRGB to linear.
+    pub fn new(
+        device: &wgpu::Device,
+        surface_texture: &wgpu::Texture,
+        format: wgpu::TextureFormat,
+        linear: bool,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("texture_copy.wgsl"));
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -71,6 +79,7 @@ impl CaptureState {
         let (texture, padding, bind_group) = Self::create_texture(
             device,
             surface_texture,
+            format,
             &bind_group_layout,
             linear_output.as_ref(),
         );
@@ -81,12 +90,19 @@ impl CaptureState {
             pipeline,
             bind_group,
             linear_output,
+            surface_format: surface_texture.format(),
         }
+    }
+
+    /// Whether this state copies to a surface of `format`, decoding to linear or not.
+    pub fn presents(&self, format: wgpu::TextureFormat, linear: bool) -> bool {
+        self.surface_format == format && self.linear_output.is_some() == linear
     }
 
     fn create_texture(
         device: &wgpu::Device,
         surface_texture: &wgpu::Texture,
+        format: wgpu::TextureFormat,
         layout: &BindGroupLayout,
         linear_output: Option<&wgpu::Buffer>,
     ) -> (wgpu::Texture, BufferPadding, wgpu::BindGroup) {
@@ -96,7 +112,7 @@ impl CaptureState {
             mip_level_count: surface_texture.mip_level_count(),
             sample_count: surface_texture.sample_count(),
             dimension: surface_texture.dimension(),
-            format: surface_texture.format(),
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -132,6 +148,7 @@ impl CaptureState {
             let (new_texture, padding, bind_group) = Self::create_texture(
                 device,
                 texture,
+                self.texture.format(),
                 &self.pipeline.get_bind_group_layout(0),
                 self.linear_output.as_ref(),
             );
