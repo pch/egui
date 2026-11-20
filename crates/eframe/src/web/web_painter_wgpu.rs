@@ -287,7 +287,12 @@ impl WebPainter for WebPainterWgpu {
 
                 let target_texture = if capture {
                     let capture_state = self.screen_capture_state.get_or_insert_with(|| {
-                        CaptureState::new(&render_state.device, &output_frame.texture)
+                        CaptureState::new(
+                            &render_state.device,
+                            &output_frame.texture,
+                            output_frame.texture.format(),
+                            false,
+                        )
                     });
                     capture_state.update(&render_state.device, &output_frame.texture);
 
