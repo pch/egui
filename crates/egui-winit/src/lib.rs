@@ -1025,13 +1025,17 @@ impl State {
                     self.egui_input.events.push(egui::Event::Copy);
                     return;
                 } else if is_paste_command(self.modifiers, active_key) {
-                    if let Some(contents) = self.clipboard.get() {
-                        let contents = contents.replace("\r\n", "\n");
-                        if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
-                        }
+                    let contents = self
+                        .clipboard
+                        .get()
+                        .map(|contents| contents.replace("\r\n", "\n"))
+                        .filter(|contents| !contents.is_empty());
+                    // With no text to paste, the key goes on as a key, so an app can give
+                    // Shift+Cmd+V or Alt+Cmd+V a command of its own.
+                    if let Some(contents) = contents {
+                        self.egui_input.events.push(egui::Event::Paste(contents));
+                        return;
                     }
-                    return;
                 }
             }
 
